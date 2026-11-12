@@ -17,6 +17,7 @@ import android.os.Looper;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
+import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -46,6 +47,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
+
+    private static final String TAG = "TVHOME";
+    private static final String TAG_IMG = "TMDBIMG";
 
     // Dock apps after "Live TV". {package name, label}
     private static final String[][] DOCK_APPS = {
@@ -241,7 +245,6 @@ public class MainActivity extends Activity {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
-        // Home pressed while we are already open: go back to the first tile.
         if (dock != null && dock.getChildCount() > 0) {
             dock.getChildAt(0).requestFocus();
         }
@@ -258,7 +261,6 @@ public class MainActivity extends Activity {
         dock.removeAllViews();
         PackageManager pm = getPackageManager();
 
-        // Live TV (local channels) first
         Drawable liveIcon = null;
         for (String pkg : LIVE_TV_PACKAGES) {
             try {
@@ -433,10 +435,19 @@ public class MainActivity extends Activity {
     }
 
     private String readKey() {
-        // Saved on the TV at:
-        // /sdcard/Android/data/com.lewis.tvhome/files/tmdb_key.txt
+        // 1) Key baked in at build time from local.properties
+        String key = BuildConfig.TMDB_API_KEY;
+        if (key != null) {
+            key = clean(key);
+            if (key != null && !key.isEmpty()) {
+                Log.d(TAG, "using BuildConfig key (" + key.length() + " chars)");
+                return key;
+            }
+        }
+        // 2) Fallback: /sdcard/Android/data/com.lewis.tvhome/files/tmdb_key.txt
         File f = new File(getExternalFilesDir(null), "tmdb_key.txt");
         if (!f.exists()) {
+            Log.w(TAG, "no key: BuildConfig empty, file missing at " + f.getAbsolutePath());
             return null;
         }
         try (BufferedReader r = new BufferedReader(new FileReader(f))) {
@@ -444,11 +455,31 @@ public class MainActivity extends Activity {
             if (s == null) {
                 return null;
             }
-            s = s.trim();
-            return s.isEmpty() ? null : s;
+            s = clean(s);
+            if (s == null || s.isEmpty()) {
+                return null;
+            }
+            Log.d(TAG, "using file key from " + f.getAbsolutePath() + " (" + s.length() + " chars)");
+            return s;
         } catch (Exception e) {
+            Log.e(TAG, "failed reading key file", e);
             return null;
         }
+    }
+
+    private String clean(String s) {
+        if (s == null) {
+            return null;
+        }
+        s = s.trim().replace("\uFEFF", "");
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch >= 32 && ch <= 126) {
+                sb.append(ch);
+            }
+        }
+        return sb.toString();
     }
 
     private void loadMovies() {
@@ -470,6 +501,7 @@ public class MainActivity extends Activity {
                 list = fetchMovies(key);
             } catch (Exception e) {
                 err = e.getClass().getSimpleName() + ": " + e.getMessage();
+                Log.e(TAG, "fetchMovies failed", e);
             }
             final List<Movie> res = list;
             final String error = err;
@@ -494,9 +526,10 @@ public class MainActivity extends Activity {
     }
 
     private List<Movie> fetchMovies(String key) throws Exception {
-        String json = new String(httpGet(
-                "https://api.themoviedb.org/3/trending/movie/week?language=en-US&api_key=" + key),
-                "UTF-8");
+        String url = "https://api.themoviedb.org/3/trending/movie/week?language=en-US&api_key="
+                + Uri.encode(key);
+        Log.d(TAG, "GET " + url.replace(key, "<key>"));
+        String json = new String(httpGet(url), "UTF-8");
         JSONArray arr = new JSONObject(json).getJSONArray("results");
         List<Movie> out = new ArrayList<>();
         for (int i = 0; i < arr.length() && out.size() < 12; i++) {
@@ -513,6 +546,7 @@ public class MainActivity extends Activity {
             m.backdrop = bd;
             out.add(m);
         }
+        Log.d(TAG, "fetched " + out.size() + " movies");
         return out;
     }
 
@@ -520,6 +554,7 @@ public class MainActivity extends Activity {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(10000);
         c.setReadTimeout(20000);
+        c.setRequestProperty("User-Agent", "tvhome/0.1");
         try {
             int code = c.getResponseCode();
             if (code != 200) {
@@ -551,11 +586,25 @@ public class MainActivity extends Activity {
         io.execute(() -> {
             Bitmap b = null;
             try {
-                byte[] data = httpGet("https://image.tmdb.org/t/p/w1280" + m.backdrop);
+                String url = "https://image.tmdb.org/t/p/w780" + m.backdrop;
+                byte[] data = httpGet(url);
+                Log.d(TAG_IMG, "downloaded " + data.length + " bytes for " + url);
                 BitmapFactory.Options o = new BitmapFactory.Options();
                 o.inPreferredConfig = Bitmap.Config.RGB_565;
+                o.inSampleSize = 1;
                 b = BitmapFactory.decodeByteArray(data, 0, data.length, o);
-            } catch (Exception ignored) {
+                if (b == null) {
+                    Log.w(TAG_IMG, "decode returned null, retrying with inSampleSize=2");
+                    o.inSampleSize = 2;
+                    b = BitmapFactory.decodeByteArray(data, 0, data.length, o);
+                }
+                if (b != null) {
+                    Log.d(TAG_IMG, "decoded " + b.getWidth() + "x" + b.getHeight());
+                } else {
+                    Log.e(TAG_IMG, "decode failed entirely for " + url);
+                }
+            } catch (Exception e) {
+                Log.e(TAG_IMG, "image fetch failed for backdrop " + m.backdrop, e);
             }
             final Bitmap bmp = b;
             handler.post(() -> {
@@ -589,8 +638,6 @@ public class MainActivity extends Activity {
     // ---------- Wallpaper and helpers ----------
 
     private void loadWallpaper() {
-        // Optional picture shown when no movie is displayed:
-        // /sdcard/Android/data/com.lewis.tvhome/files/wallpaper.jpg
         File f = new File(getExternalFilesDir(null), "wallpaper.jpg");
         if (f.exists()) {
             BitmapFactory.Options o = new BitmapFactory.Options();
