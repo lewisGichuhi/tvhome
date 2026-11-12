@@ -35,8 +35,11 @@ import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.InputStream;
+import java.io.OutputStreamWriter;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
@@ -50,8 +53,11 @@ public class MainActivity extends Activity {
 
     private static final String TAG = "TVHOME";
     private static final String TAG_IMG = "TMDBIMG";
+    private static final String CACHE_JSON = "trending_cache.json";
+    private static final String CACHE_TIME = "trending_cache_time.txt";
+    private static final String CACHE_DIR = "backdrops";
+    private static final long CACHE_TTL_MS = 24L * 60 * 60 * 1000; // 24 hours
 
-    // Dock apps after "Live TV". {package name, label}
     private static final String[][] DOCK_APPS = {
             {"com.netflix.mediaclient", "Netflix"},
             {"com.google.android.youtube.tv", "YouTube"},
@@ -59,7 +65,6 @@ public class MainActivity extends Activity {
             {"com.android.chrome", "Chrome"},
     };
 
-    // The TV's own app for local channels. The first one that opens is used.
     private static final String[] LIVE_TV_PACKAGES = {
             "com.mstar.tv.tvplayer.ui",
             "com.mstar.android.tv.app",
@@ -114,7 +119,6 @@ public class MainActivity extends Activity {
         heroFront.setAlpha(0f);
         root.addView(heroFront, matchParent());
 
-        // Darken the left side (text) and the bottom (tiles)
         View leftScrim = new View(this);
         leftScrim.setBackground(new GradientDrawable(
                 GradientDrawable.Orientation.LEFT_RIGHT, new int[]{0xE6000000, 0x00000000}));
@@ -127,7 +131,6 @@ public class MainActivity extends Activity {
         root.addView(bottomScrim, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, (int) (sh * 0.45f), Gravity.BOTTOM));
 
-        // Clock, top-left
         TextClock clock = new TextClock(this);
         clock.setFormat12Hour("h:mm a");
         clock.setFormat24Hour("HH:mm");
@@ -139,7 +142,6 @@ public class MainActivity extends Activity {
         clockLp.setMargins((int) (sw * 0.05f), (int) (sh * 0.05f), 0, 0);
         root.addView(clock, clockLp);
 
-        // Hero text block
         LinearLayout hero = new LinearLayout(this);
         hero.setOrientation(LinearLayout.VERTICAL);
 
@@ -189,7 +191,6 @@ public class MainActivity extends Activity {
         heroLp.setMargins((int) (sw * 0.05f), (int) (sh * 0.27f), 0, 0);
         root.addView(hero, heroLp);
 
-        // Dock
         dock = new LinearLayout(this);
         dock.setOrientation(LinearLayout.HORIZONTAL);
         dock.setGravity(Gravity.CENTER);
@@ -200,7 +201,6 @@ public class MainActivity extends Activity {
         dockLp.setMargins(0, 0, 0, (int) (sh * 0.07f));
         root.addView(dock, dockLp);
 
-        // TMDB credit (required by their terms when using their data)
         credit = new TextView(this);
         credit.setText("Movie data: TMDB");
         credit.setTextColor(0x88FFFFFF);
@@ -435,7 +435,6 @@ public class MainActivity extends Activity {
     }
 
     private String readKey() {
-        // 1) Key baked in at build time from local.properties
         String key = BuildConfig.TMDB_API_KEY;
         if (key != null) {
             key = clean(key);
@@ -444,7 +443,6 @@ public class MainActivity extends Activity {
                 return key;
             }
         }
-        // 2) Fallback: /sdcard/Android/data/com.lewis.tvhome/files/tmdb_key.txt
         File f = new File(getExternalFilesDir(null), "tmdb_key.txt");
         if (!f.exists()) {
             Log.w(TAG, "no key: BuildConfig empty, file missing at " + f.getAbsolutePath());
@@ -482,54 +480,86 @@ public class MainActivity extends Activity {
         return sb.toString();
     }
 
-    private void loadMovies() {
-        if (loading) {
-            return;
-        }
-        final String key = readKey();
-        if (key == null) {
-            setStatus("Add a TMDB key to show trending movies here.");
-            return;
-        }
-        loading = true;
-        setStatus("Loading trending movies...");
+    // ---------- Cache helpers ----------
 
-        io.execute(() -> {
-            List<Movie> list = null;
-            String err = null;
-            try {
-                list = fetchMovies(key);
-            } catch (Exception e) {
-                err = e.getClass().getSimpleName() + ": " + e.getMessage();
-                Log.e(TAG, "fetchMovies failed", e);
-            }
-            final List<Movie> res = list;
-            final String error = err;
-            handler.post(() -> {
-                loading = false;
-                if (res != null && !res.isEmpty()) {
-                    movies.clear();
-                    movies.addAll(res);
-                    index = -1;
-                    watchBtn.setVisibility(View.VISIBLE);
-                    credit.setVisibility(View.VISIBLE);
-                    showNext();
-                } else {
-                    setStatus(error != null ? "Could not load movies (" + error + ")"
-                            : "No movies found.");
-                    if (resumed) {
-                        handler.postDelayed(retryRunnable, 60000);
-                    }
-                }
-            });
-        });
+    private File cacheJsonFile() {
+        return new File(getExternalFilesDir(null), CACHE_JSON);
     }
 
-    private List<Movie> fetchMovies(String key) throws Exception {
-        String url = "https://api.themoviedb.org/3/trending/movie/week?language=en-US&api_key="
-                + Uri.encode(key);
-        Log.d(TAG, "GET " + url.replace(key, "<key>"));
-        String json = new String(httpGet(url), "UTF-8");
+    private File cacheTimeFile() {
+        return new File(getExternalFilesDir(null), CACHE_TIME);
+    }
+
+    private File cacheDir() {
+        File d = new File(getExternalFilesDir(null), CACHE_DIR);
+        if (!d.exists()) {
+            d.mkdirs();
+        }
+        return d;
+    }
+
+    private String imageCacheName(String backdrop) {
+        // "/abc.jpg" -> "abc.jpg"
+        String name = backdrop.startsWith("/") ? backdrop.substring(1) : backdrop;
+        return name.replace('/', '_');
+    }
+
+    private File imageCacheFile(String backdrop) {
+        return new File(cacheDir(), imageCacheName(backdrop));
+    }
+
+    private boolean cacheIsFresh() {
+        File t = cacheTimeFile();
+        if (!t.exists()) {
+            return false;
+        }
+        try (BufferedReader r = new BufferedReader(new FileReader(t))) {
+            String s = r.readLine();
+            if (s == null) {
+                return false;
+            }
+            long saved = Long.parseLong(s.trim());
+            return System.currentTimeMillis() - saved < CACHE_TTL_MS;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void saveCacheJson(String json) {
+        try {
+            try (OutputStreamWriter w = new OutputStreamWriter(
+                    new FileOutputStream(cacheJsonFile()), "UTF-8")) {
+                w.write(json);
+            }
+            try (OutputStreamWriter w = new OutputStreamWriter(
+                    new FileOutputStream(cacheTimeFile()), "UTF-8")) {
+                w.write(String.valueOf(System.currentTimeMillis()));
+            }
+            Log.d(TAG, "cache saved");
+        } catch (Exception e) {
+            Log.e(TAG, "failed saving cache", e);
+        }
+    }
+
+    private String loadCacheJson() {
+        File f = cacheJsonFile();
+        if (!f.exists()) {
+            return null;
+        }
+        try (BufferedReader r = new BufferedReader(new FileReader(f))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) {
+                sb.append(line);
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            Log.e(TAG, "failed reading cache", e);
+            return null;
+        }
+    }
+
+    private List<Movie> parseMovies(String json) throws Exception {
         JSONArray arr = new JSONObject(json).getJSONArray("results");
         List<Movie> out = new ArrayList<>();
         for (int i = 0; i < arr.length() && out.size() < 12; i++) {
@@ -546,8 +576,100 @@ public class MainActivity extends Activity {
             m.backdrop = bd;
             out.add(m);
         }
-        Log.d(TAG, "fetched " + out.size() + " movies");
         return out;
+    }
+
+    private void showMovies(List<Movie> list, boolean fromCache) {
+        movies.clear();
+        movies.addAll(list);
+        index = -1;
+        watchBtn.setVisibility(View.VISIBLE);
+        credit.setVisibility(View.VISIBLE);
+        Log.d(TAG, "showing " + list.size() + " movies (" + (fromCache ? "cache" : "network") + ")");
+        showNext();
+    }
+
+    // ---------- Loading ----------
+
+    private void loadMovies() {
+        if (loading) {
+            return;
+        }
+        loading = true;
+
+        // 1) Show cache immediately if present
+        final String cached = loadCacheJson();
+        if (cached != null) {
+            try {
+                List<Movie> cachedList = parseMovies(cached);
+                if (!cachedList.isEmpty()) {
+                    showMovies(cachedList, true);
+                    setStatus(""); // clear any status text
+                    heroTitle.setText("");
+                    heroOverview.setText("");
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "cache parse failed", e);
+            }
+        }
+
+        // 2) If cache is fresh, don't hit the network
+        if (cacheIsFresh()) {
+            Log.d(TAG, "cache is fresh, skipping network");
+            loading = false;
+            if (movies.isEmpty()) {
+                setStatus("Loading trending movies...");
+            }
+            return;
+        }
+
+        final String key = readKey();
+        if (key == null) {
+            loading = false;
+            if (movies.isEmpty()) {
+                setStatus("Add a TMDB key to show trending movies here.");
+            }
+            return;
+        }
+
+        if (movies.isEmpty()) {
+            setStatus("Loading trending movies...");
+        }
+
+        // 3) Background refresh
+        io.execute(() -> {
+            List<Movie> list = null;
+            String rawJson = null;
+            String err = null;
+            try {
+                String url = "https://api.themoviedb.org/3/trending/movie/week?language=en-US&api_key="
+                        + Uri.encode(key);
+                Log.d(TAG, "GET " + url.replace(key, "<key>"));
+                rawJson = new String(httpGet(url), "UTF-8");
+                list = parseMovies(rawJson);
+            } catch (Exception e) {
+                err = e.getClass().getSimpleName() + ": " + e.getMessage();
+                Log.e(TAG, "fetchMovies failed", e);
+            }
+            final List<Movie> res = list;
+            final String json = rawJson;
+            final String error = err;
+            handler.post(() -> {
+                loading = false;
+                if (res != null && !res.isEmpty()) {
+                    saveCacheJson(json);
+                    showMovies(res, false);
+                } else if (movies.isEmpty()) {
+                    setStatus(error != null ? "Could not load movies (" + error + ")"
+                            : "No movies found.");
+                    if (resumed) {
+                        handler.postDelayed(retryRunnable, 60000);
+                    }
+                } else {
+                    Log.w(TAG, "refresh failed, keeping cache: " + error);
+                }
+            });
+        });
     }
 
     private byte[] httpGet(String url) throws Exception {
@@ -574,6 +696,8 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ---------- Slideshow ----------
+
     private void showNext() {
         handler.removeCallbacks(slideRunnable);
         if (movies.isEmpty() || !resumed) {
@@ -585,26 +709,36 @@ public class MainActivity extends Activity {
 
         io.execute(() -> {
             Bitmap b = null;
+            File cached = imageCacheFile(m.backdrop);
             try {
-                String url = "https://image.tmdb.org/t/p/w780" + m.backdrop;
-                byte[] data = httpGet(url);
-                Log.d(TAG_IMG, "downloaded " + data.length + " bytes for " + url);
+                byte[] data;
+                if (cached.exists()) {
+                    data = readFile(cached);
+                    Log.d(TAG_IMG, "cache hit " + cached.getName() + " (" + data.length + " bytes)");
+                } else {
+                    String url = "https://image.tmdb.org/t/p/w780" + m.backdrop;
+                    data = httpGet(url);
+                    Log.d(TAG_IMG, "downloaded " + data.length + " bytes for " + url);
+                    try (FileOutputStream out = new FileOutputStream(cached)) {
+                        out.write(data);
+                    }
+                }
                 BitmapFactory.Options o = new BitmapFactory.Options();
                 o.inPreferredConfig = Bitmap.Config.RGB_565;
                 o.inSampleSize = 1;
                 b = BitmapFactory.decodeByteArray(data, 0, data.length, o);
                 if (b == null) {
-                    Log.w(TAG_IMG, "decode returned null, retrying with inSampleSize=2");
+                    Log.w(TAG_IMG, "decode null, retry inSampleSize=2");
                     o.inSampleSize = 2;
                     b = BitmapFactory.decodeByteArray(data, 0, data.length, o);
                 }
                 if (b != null) {
                     Log.d(TAG_IMG, "decoded " + b.getWidth() + "x" + b.getHeight());
                 } else {
-                    Log.e(TAG_IMG, "decode failed entirely for " + url);
+                    Log.e(TAG_IMG, "decode failed entirely");
                 }
             } catch (Exception e) {
-                Log.e(TAG_IMG, "image fetch failed for backdrop " + m.backdrop, e);
+                Log.e(TAG_IMG, "image failed for " + m.backdrop, e);
             }
             final Bitmap bmp = b;
             handler.post(() -> {
@@ -620,6 +754,18 @@ public class MainActivity extends Activity {
                 handler.postDelayed(slideRunnable, SLIDE_MS);
             });
         });
+    }
+
+    private byte[] readFile(File f) throws Exception {
+        try (FileInputStream in = new FileInputStream(f)) {
+            ByteArrayOutputStream bo = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                bo.write(buf, 0, n);
+            }
+            return bo.toByteArray();
+        }
     }
 
     private void crossfadeTo(Bitmap bmp) {
