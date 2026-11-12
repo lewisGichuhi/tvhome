@@ -13,14 +13,13 @@ android {
         versionCode 1
         versionName '0.1'
 
-        // TMDB token from local.properties (gitignored) -> BuildConfig.TMDB_READ_TOKEN
         def localProps = new Properties()
         def localFile = rootProject.file("local.properties")
         if (localFile.exists()) {
             localFile.withInputStream { localProps.load(it) }
         }
-        buildConfigField "String", "TMDB_READ_TOKEN",
-            "\"${localProps.getProperty('TMDB_READ_TOKEN', '')}\""
+        buildConfigField "String", "TMDB_API_KEY",
+            "\"${localProps.getProperty('TMDB_API_KEY', '')}\""
     }
 
     buildFeatures {
